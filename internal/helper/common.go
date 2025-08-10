@@ -3,8 +3,8 @@ package helper
 import (
 	"strconv"
 
-	"github.com/gofiber/fiber/v3"
 	"github.com/go-playground/validator/v10"
+	"github.com/gofiber/fiber/v3"
 )
 
 type Pagination[T any] struct {
@@ -38,5 +38,13 @@ func GetPagination[T any](c fiber.Ctx) Pagination[T] {
 var validate = validator.New()
 
 func ValidateInput(input interface{}) error {
-    return validate.Struct(input)
+	return validate.Struct(input)
+}
+
+func MapToSlice[T any](m map[string]T) []T {
+	var slice []T
+	for _, v := range m {
+		slice = append(slice, v)
+	}
+	return slice
 }

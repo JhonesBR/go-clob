@@ -26,16 +26,16 @@ func CreateNewAccount(db *pgxpool.Pool) fiber.Handler {
 		}
 
 		// Create a new account at database
-		accountId := uuid.New()
-
-		err := db.QueryRow(context.Background(), "INSERT INTO accounts (id, balance) VALUES ($1, $2) RETURNING id, balance", accountId, account.Balance).Scan(&accountId, &account.Balance)
+		var accountId uuid.UUID
+		err := db.QueryRow(context.Background(), "INSERT INTO accounts (name) VALUES ($1) RETURNING id", account.Name).Scan(&accountId)
 		if err != nil {
 			return err
 		}
 
 		return c.JSON(CreateAccountResponseSchema{
-			Id:      accountId.String(),
-			Balance: *account.Balance,
+			Id:       accountId.String(),
+			Name:     account.Name,
+			Balances: []AccountBalanceSchema{},
 		})
 	}
 }
@@ -54,23 +54,51 @@ func GetAccounts(db *pgxpool.Pool) fiber.Handler {
 		pagination.Total = &total
 
 		// Retrieve accounts
-		query := fmt.Sprintf("SELECT id, balance FROM accounts LIMIT %d OFFSET %d", pagination.Size, (pagination.Page-1)*pagination.Size)
+		query := fmt.Sprintf(
+			`SELECT acc.id, acc.name, ab.balance, assets.code, assets.id
+			 FROM accounts acc
+			 LEFT JOIN account_balances ab ON acc.id = ab.account_id
+			 LEFT JOIN assets ON ab.asset_id = assets.id
+			 LIMIT %d OFFSET %d`,
+			pagination.Size,
+			(pagination.Page-1)*pagination.Size,
+		)
 		rows, err := db.Query(context.Background(), query)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 
-		var accounts []AccountShowSchema
+		var accounts = make(map[string]AccountShowSchema)
 		for rows.Next() {
 			var account AccountShowSchema
-			if err := rows.Scan(&account.Id, &account.Balance); err != nil {
+			var balance *decimal.Decimal
+			var assetCode *string
+			var assetId *uuid.UUID
+			if err := rows.Scan(&account.Id, &account.Name, &balance, &assetCode, &assetId); err != nil {
 				return err
 			}
-			accounts = append(accounts, account)
+
+			if _, ok := accounts[account.Id]; !ok {
+				accounts[account.Id] = AccountShowSchema{
+					Id:       account.Id,
+					Name:     account.Name,
+					Balances: make([]AccountBalanceSchema, 0),
+				}
+			}
+
+			if balance != nil && assetCode != nil {
+				accountData := accounts[account.Id]
+				accountData.Balances = append(accountData.Balances, AccountBalanceSchema{
+					AssetId:   assetId,
+					Balance:   balance,
+					AssetCode: assetCode,
+				})
+				accounts[account.Id] = accountData
+			}
 		}
 
-		pagination.Items = accounts
+		pagination.Items = helper.MapToSlice(accounts)
 
 		return c.JSON(pagination)
 	}
@@ -85,12 +113,30 @@ func GetAccountByID(db *pgxpool.Pool) fiber.Handler {
 
 		// Get account
 		var account AccountShowSchema
-		err := db.QueryRow(context.Background(), "SELECT id, balance FROM accounts WHERE id = $1", id).Scan(&account.Id, &account.Balance)
+		query := fmt.Sprintf(`
+			SELECT acc.id, acc.name, ab.balance, assets.code, assets.id
+			 FROM accounts acc
+			 LEFT JOIN account_balances ab ON acc.id = ab.account_id
+			 LEFT JOIN assets ON ab.asset_id = assets.id
+			 WHERE acc.id = '%s'
+		`, id)
+
+		rows, err := db.Query(context.Background(), query)
 		if err != nil {
-			if err == pgx.ErrNoRows {
-				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Account not found"})
-			}
 			return err
+		}
+		defer rows.Close()
+
+		account.Balances = make([]AccountBalanceSchema, 0)
+		for rows.Next() {
+			var balance AccountBalanceSchema
+			if err := rows.Scan(&account.Id, &account.Name, &balance.Balance, &balance.AssetCode, &balance.AssetId); err != nil {
+				return err
+			}
+
+			if balance.Balance != nil {
+				account.Balances = append(account.Balances, balance)
+			}
 		}
 
 		return c.JSON(account)
@@ -111,12 +157,6 @@ func UpdateAccountBalance(ctx context.Context, db *pgxpool.Pool, operation strin
 		}
 		defer tx.Rollback(ctx)
 
-		// Get account balance
-		balance, err := getAccountBalance(ctx, db, id)
-		if err != nil {
-			return err
-		}
-
 		// Charge or remove balance
 		var charge UpdateBalanceSchema
 		if err := c.Bind().Body(&charge); err != nil {
@@ -128,6 +168,16 @@ func UpdateAccountBalance(ctx context.Context, db *pgxpool.Pool, operation strin
 			})
 		}
 
+		// Get account balance
+		balance, assetId, err := getAccountBalance(ctx, db, id, *charge.AssetCode)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				createAccountBalanceForAccount(ctx, db, id, *assetId)
+			} else {
+				return err
+			}
+		}
+
 		switch operation {
 		case "charge":
 			balance = balance.Add(*charge.Amount)
@@ -135,7 +185,7 @@ func UpdateAccountBalance(ctx context.Context, db *pgxpool.Pool, operation strin
 			balance = balance.Sub(*charge.Amount)
 		}
 
-		updateAccountBalance(ctx, db, id, balance)
+		updateAccountBalance(ctx, db, id, balance, *assetId)
 
 		// Commit transaction
 		if err := tx.Commit(ctx); err != nil {
@@ -143,24 +193,43 @@ func UpdateAccountBalance(ctx context.Context, db *pgxpool.Pool, operation strin
 		}
 
 		return c.JSON(UpdateBalanceResponseSchema{
-			Balance: balance,
+			Balance:   &balance,
+			AssetCode: charge.AssetCode,
 		})
 	}
 }
 
-func getAccountBalance(ctx context.Context, db *pgxpool.Pool, id string) (decimal.Decimal, error) {
-	var balance decimal.Decimal
-	err := db.QueryRow(ctx, "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", id).Scan(&balance)
+func getAccountBalance(ctx context.Context, db *pgxpool.Pool, accountId, assetCode string) (decimal.Decimal, *uuid.UUID, error) {
+	var assetId uuid.UUID
+	err := db.QueryRow(ctx, "SELECT id FROM assets WHERE code = $1", assetCode).Scan(&assetId)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return decimal.Decimal{}, fmt.Errorf("account not found")
+			return decimal.NewFromInt(0), nil, fmt.Errorf("asset not found")
 		}
-		return decimal.Decimal{}, err
+		return decimal.Decimal{}, nil, err
 	}
-	return balance, nil
+
+	var balance decimal.Decimal
+	query := `
+		SELECT ab.balance, assets.id
+		FROM assets
+		LEFT OUTER JOIN account_balances ab ON ab.asset_id = assets.id AND ab.account_id = $1
+		WHERE assets.code = $2
+		AND ab.asset_id IS NOT NULL
+	`
+	err = db.QueryRow(ctx, query, accountId, assetCode).Scan(&balance, &assetId)
+	if err != nil {
+		return decimal.Decimal{}, &assetId, err
+	}
+	return balance, &assetId, nil
 }
 
-func updateAccountBalance(ctx context.Context, db *pgxpool.Pool, id string, newBalance decimal.Decimal) error {
-	_, err := db.Exec(ctx, "UPDATE accounts SET balance = $1 WHERE id = $2", newBalance, id)
+func updateAccountBalance(ctx context.Context, db *pgxpool.Pool, id string, newBalance decimal.Decimal, assetId uuid.UUID) error {
+	_, err := db.Exec(ctx, "UPDATE account_balances SET balance = $1 WHERE account_id = $2 AND asset_id = $3", newBalance, id, assetId)
+	return err
+}
+
+func createAccountBalanceForAccount(ctx context.Context, db *pgxpool.Pool, accountId string, assetId uuid.UUID) error {
+	_, err := db.Exec(ctx, "INSERT INTO account_balances (account_id, asset_id, balance) VALUES ($1, $2, $3)", accountId, assetId, decimal.NewFromInt(0))
 	return err
 }
