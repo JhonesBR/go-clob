@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS accounts (
+    id UUID PRIMARY KEY,
+    balance NUMERIC NOT NULL
+);
