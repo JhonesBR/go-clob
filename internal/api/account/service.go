@@ -12,7 +12,7 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-func CreateNewAccount(db *pgxpool.Pool) fiber.Handler {
+func CreateNewAccountHandler(db *pgxpool.Pool) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		// Parse create account schema
 		var account = CreateAccountSchema{}
@@ -40,7 +40,7 @@ func CreateNewAccount(db *pgxpool.Pool) fiber.Handler {
 	}
 }
 
-func GetAccounts(db *pgxpool.Pool) fiber.Handler {
+func GetAccountsHandler(db *pgxpool.Pool) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		// Get pagination
 		pagination := helper.GetPagination[AccountShowSchema](c)
@@ -104,7 +104,7 @@ func GetAccounts(db *pgxpool.Pool) fiber.Handler {
 	}
 }
 
-func GetAccountByID(db *pgxpool.Pool) fiber.Handler {
+func GetAccountByIDHandler(db *pgxpool.Pool) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		id := c.Params("id")
 		if id == "" {
@@ -143,12 +143,13 @@ func GetAccountByID(db *pgxpool.Pool) fiber.Handler {
 	}
 }
 
-func UpdateAccountBalance(ctx context.Context, db *pgxpool.Pool, operation string) fiber.Handler {
+func UpdateAccountBalanceHandler(ctx context.Context, db *pgxpool.Pool, operation string) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		id := c.Params("id")
 		if id == "" {
 			return fiber.ErrBadRequest
 		}
+		uuidId := uuid.MustParse(id)
 
 		// Transaction to ensure correct update on race conditions
 		tx, err := db.BeginTx(ctx, pgx.TxOptions{})
@@ -169,10 +170,10 @@ func UpdateAccountBalance(ctx context.Context, db *pgxpool.Pool, operation strin
 		}
 
 		// Get account balance
-		balance, assetId, err := getAccountBalance(ctx, db, id, *charge.AssetCode)
+		balance, assetId, err := GetAccountBalance(ctx, tx, uuidId, *charge.AssetCode)
 		if err != nil {
 			if err == pgx.ErrNoRows {
-				createAccountBalanceForAccount(ctx, db, id, *assetId)
+				createAccountBalanceForAccount(ctx, tx, uuidId, *assetId)
 			} else {
 				return err
 			}
@@ -185,7 +186,7 @@ func UpdateAccountBalance(ctx context.Context, db *pgxpool.Pool, operation strin
 			balance = balance.Sub(*charge.Amount)
 		}
 
-		updateAccountBalance(ctx, db, id, balance, *assetId)
+		UpdateAccountBalance(ctx, tx, uuidId, balance, *assetId)
 
 		// Commit transaction
 		if err := tx.Commit(ctx); err != nil {
@@ -199,9 +200,9 @@ func UpdateAccountBalance(ctx context.Context, db *pgxpool.Pool, operation strin
 	}
 }
 
-func getAccountBalance(ctx context.Context, db *pgxpool.Pool, accountId, assetCode string) (decimal.Decimal, *uuid.UUID, error) {
+func GetAccountBalance(ctx context.Context, tx pgx.Tx, accountId uuid.UUID, assetCode string) (decimal.Decimal, *uuid.UUID, error) {
 	var assetId uuid.UUID
-	err := db.QueryRow(ctx, "SELECT id FROM assets WHERE code = $1", assetCode).Scan(&assetId)
+	err := tx.QueryRow(ctx, "SELECT id FROM assets WHERE code = $1", assetCode).Scan(&assetId)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return decimal.NewFromInt(0), nil, fmt.Errorf("asset not found")
@@ -217,19 +218,19 @@ func getAccountBalance(ctx context.Context, db *pgxpool.Pool, accountId, assetCo
 		WHERE assets.code = $2
 		AND ab.asset_id IS NOT NULL
 	`
-	err = db.QueryRow(ctx, query, accountId, assetCode).Scan(&balance, &assetId)
+	err = tx.QueryRow(ctx, query, accountId, assetCode).Scan(&balance, &assetId)
 	if err != nil {
 		return decimal.Decimal{}, &assetId, err
 	}
 	return balance, &assetId, nil
 }
 
-func updateAccountBalance(ctx context.Context, db *pgxpool.Pool, id string, newBalance decimal.Decimal, assetId uuid.UUID) error {
-	_, err := db.Exec(ctx, "UPDATE account_balances SET balance = $1 WHERE account_id = $2 AND asset_id = $3", newBalance, id, assetId)
+func UpdateAccountBalance(ctx context.Context, tx pgx.Tx, id uuid.UUID, newBalance decimal.Decimal, assetId uuid.UUID) error {
+	_, err := tx.Exec(ctx, "UPDATE account_balances SET balance = $1 WHERE account_id = $2 AND asset_id = $3", newBalance, id, assetId)
 	return err
 }
 
-func createAccountBalanceForAccount(ctx context.Context, db *pgxpool.Pool, accountId string, assetId uuid.UUID) error {
-	_, err := db.Exec(ctx, "INSERT INTO account_balances (account_id, asset_id, balance) VALUES ($1, $2, $3)", accountId, assetId, decimal.NewFromInt(0))
+func createAccountBalanceForAccount(ctx context.Context, tx pgx.Tx, accountId, assetId uuid.UUID) error {
+	_, err := tx.Exec(ctx, "INSERT INTO account_balances (account_id, asset_id, balance) VALUES ($1, $2, $3)", accountId, assetId, decimal.NewFromInt(0))
 	return err
 }
