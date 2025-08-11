@@ -170,10 +170,10 @@ func UpdateAccountBalanceHandler(ctx context.Context, db *pgxpool.Pool, operatio
 		}
 
 		// Get account balance
-		balance, assetId, err := GetAccountBalance(ctx, tx, uuidId, *charge.AssetCode)
+		balance, assetId, err := GetAccountBalance(ctx, tx, uuidId, charge.AssetCode, nil)
 		if err != nil {
 			if err == pgx.ErrNoRows {
-				createAccountBalanceForAccount(ctx, tx, uuidId, *assetId)
+				CreateAccountBalanceForAccount(ctx, tx, uuidId, *assetId)
 			} else {
 				return err
 			}
@@ -181,12 +181,15 @@ func UpdateAccountBalanceHandler(ctx context.Context, db *pgxpool.Pool, operatio
 
 		switch operation {
 		case "charge":
-			balance = balance.Add(*charge.Amount)
+			*balance = balance.Add(*charge.Amount)
 		case "remove":
-			balance = balance.Sub(*charge.Amount)
+			*balance = balance.Sub(*charge.Amount)
 		}
 
-		UpdateAccountBalance(ctx, tx, uuidId, balance, *assetId)
+		err = UpdateAccountBalance(ctx, tx, uuidId, *balance, *assetId)
+		if err != nil {
+			return err
+		}
 
 		// Commit transaction
 		if err := tx.Commit(ctx); err != nil {
@@ -194,35 +197,35 @@ func UpdateAccountBalanceHandler(ctx context.Context, db *pgxpool.Pool, operatio
 		}
 
 		return c.JSON(UpdateBalanceResponseSchema{
-			Balance:   &balance,
+			Balance:   balance,
 			AssetCode: charge.AssetCode,
 		})
 	}
 }
 
-func GetAccountBalance(ctx context.Context, tx pgx.Tx, accountId uuid.UUID, assetCode string) (decimal.Decimal, *uuid.UUID, error) {
-	var assetId uuid.UUID
-	err := tx.QueryRow(ctx, "SELECT id FROM assets WHERE code = $1", assetCode).Scan(&assetId)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return decimal.NewFromInt(0), nil, fmt.Errorf("asset not found")
+func GetAccountBalance(ctx context.Context, tx pgx.Tx, accountId uuid.UUID, assetCode *string, assetId *uuid.UUID) (*decimal.Decimal, *uuid.UUID, error) {
+	if assetId == nil {
+		err := tx.QueryRow(ctx, "SELECT id FROM assets WHERE code = $1", assetCode).Scan(&assetId)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return &decimal.Decimal{}, nil, fmt.Errorf("asset not found")
+			}
+			return &decimal.Decimal{}, nil, err
 		}
-		return decimal.Decimal{}, nil, err
 	}
 
-	var balance decimal.Decimal
+	var balance *decimal.Decimal
 	query := `
-		SELECT ab.balance, assets.id
+		SELECT ab.balance
 		FROM assets
 		LEFT OUTER JOIN account_balances ab ON ab.asset_id = assets.id AND ab.account_id = $1
-		WHERE assets.code = $2
-		AND ab.asset_id IS NOT NULL
+		WHERE assets.id = $2
 	`
-	err = tx.QueryRow(ctx, query, accountId, assetCode).Scan(&balance, &assetId)
+	err := tx.QueryRow(ctx, query, accountId, assetId).Scan(&balance)
 	if err != nil {
-		return decimal.Decimal{}, &assetId, err
+		return &decimal.Decimal{}, assetId, err
 	}
-	return balance, &assetId, nil
+	return balance, assetId, nil
 }
 
 func UpdateAccountBalance(ctx context.Context, tx pgx.Tx, id uuid.UUID, newBalance decimal.Decimal, assetId uuid.UUID) error {
@@ -230,7 +233,7 @@ func UpdateAccountBalance(ctx context.Context, tx pgx.Tx, id uuid.UUID, newBalan
 	return err
 }
 
-func createAccountBalanceForAccount(ctx context.Context, tx pgx.Tx, accountId, assetId uuid.UUID) error {
-	_, err := tx.Exec(ctx, "INSERT INTO account_balances (account_id, asset_id, balance) VALUES ($1, $2, $3)", accountId, assetId, decimal.NewFromInt(0))
+func CreateAccountBalanceForAccount(ctx context.Context, tx pgx.Tx, accountId, assetId uuid.UUID) error {
+	_, err := tx.Exec(ctx, "INSERT INTO account_balances (account_id, asset_id, balance) VALUES ($1, $2, 0)", accountId, assetId)
 	return err
 }

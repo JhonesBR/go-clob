@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/shopspring/decimal"
 )
 
 func PlaceOrderHandler(ctx context.Context, db *pgxpool.Pool) fiber.Handler {
@@ -51,7 +52,7 @@ func PlaceOrderHandler(ctx context.Context, db *pgxpool.Pool) fiber.Handler {
 		}
 
 		// Verify if the account has the balance
-		balance, assetId, err := account.GetAccountBalance(ctx, tx, order.AccountId, assetCode)
+		balance, assetId, err := account.GetAccountBalance(ctx, tx, order.AccountId, &assetCode, nil)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				return c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
@@ -60,23 +61,39 @@ func PlaceOrderHandler(ctx context.Context, db *pgxpool.Pool) fiber.Handler {
 			}
 			return err
 		}
-		if balance.LessThan(order.Quantity.Mul(order.Price)) {
+
+		// Verify if the account has the necessary balance
+		var necessaryBalance decimal.Decimal
+		if order.OrderType == Buy {
+			necessaryBalance = order.Quantity.Mul(order.Price)
+		} else {
+			necessaryBalance = order.Quantity
+		}
+		if balance.LessThan(necessaryBalance) {
 			return c.Status(fiber.StatusPaymentRequired).JSON(fiber.Map{
 				"error": "Insufficient funds",
 			})
 		}
 
 		// Update balance from account
-		if err := account.UpdateAccountBalance(ctx, tx, order.AccountId, balance.Sub(order.Quantity.Mul(order.Price)), *assetId); err != nil {
+		var newBalance decimal.Decimal
+		if order.OrderType == Buy {
+			newBalance = balance.Sub(order.Quantity.Mul(order.Price))
+		} else {
+			newBalance = balance.Sub(order.Quantity)
+		}
+		if err := account.UpdateAccountBalance(ctx, tx, order.AccountId, newBalance, *assetId); err != nil {
 			return err
 		}
 
 		// Create a new order at database
+		var orderId uuid.UUID
 		query := `
 			INSERT INTO order_book (account_id, instrument_id, type, status, price, total_quantity, filled_quantity)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			RETURNING id
 		`
-		tx.Exec(
+		err = tx.QueryRow(
 			context.Background(),
 			query,
 			order.AccountId,
@@ -86,7 +103,25 @@ func PlaceOrderHandler(ctx context.Context, db *pgxpool.Pool) fiber.Handler {
 			order.Price,
 			order.Quantity,
 			0,
-		)
+		).Scan(&orderId)
+		if err != nil {
+			return err
+		}
+
+		// Match order
+		orderToMatch := OrderBook{
+			Id:             orderId,
+			AccountId:      order.AccountId,
+			InstrumentId:   instrument.Id,
+			Type:           order.OrderType,
+			Status:         Open,
+			Price:          order.Price,
+			TotalQuantity:  order.Quantity,
+			FilledQuantity: decimal.NewFromInt(0),
+		}
+		if err := matchOrder(ctx, tx, orderToMatch, instrument); err != nil {
+			return err
+		}
 
 		// Commit transaction
 		if err := tx.Commit(ctx); err != nil {
@@ -206,5 +241,197 @@ func verifyOrderCancelationEligibility(order OrderBook) error {
 
 func updateOrderStatus(ctx context.Context, tx pgx.Tx, orderId uuid.UUID, status OrderStatus) error {
 	_, err := tx.Exec(ctx, "UPDATE order_book SET status = $1 WHERE id = $2", status, orderId)
+	return err
+}
+
+func matchOrder(ctx context.Context, tx pgx.Tx, order OrderBook, instrument InstrumentWithAssetsSchema) error {
+	// Get matches for buy/sell order
+	var matchOrders []OrderBook
+	var err error
+	if order.Type == Buy {
+		matchOrders, err = getCompatibleSellOrders(ctx, tx, order)
+		if err != nil {
+			return err
+		}
+	} else {
+		matchOrders, err = getCompatibleBuyOrders(ctx, tx, order)
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, match := range matchOrders {
+		order, err = processMatch(ctx, tx, order, match, instrument)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func getCompatibleSellOrders(ctx context.Context, tx pgx.Tx, order OrderBook) ([]OrderBook, error) {
+	var compatibleOrders []OrderBook
+
+	query := `
+		SELECT id, account_id, instrument_id, type, status, price, total_quantity, filled_quantity
+		FROM order_book
+		WHERE
+			instrument_id = $1
+			AND type = 'sell'
+			AND status IN ('open', 'partially_filled')
+			AND price <= $2
+		ORDER BY
+			price ASC,
+			created_at ASC
+		FOR UPDATE SKIP LOCKED
+	`
+	rows, err := tx.Query(ctx, query, order.InstrumentId, order.Price)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var compatibleOrder OrderBook
+		if err := rows.Scan(&compatibleOrder.Id, &compatibleOrder.AccountId, &compatibleOrder.InstrumentId, &compatibleOrder.Type, &compatibleOrder.Status, &compatibleOrder.Price, &compatibleOrder.TotalQuantity, &compatibleOrder.FilledQuantity); err != nil {
+			return nil, err
+		}
+		compatibleOrders = append(compatibleOrders, compatibleOrder)
+	}
+
+	return compatibleOrders, nil
+}
+
+func getCompatibleBuyOrders(ctx context.Context, tx pgx.Tx, order OrderBook) ([]OrderBook, error) {
+	var compatibleOrders []OrderBook
+
+	query := `
+		SELECT id, account_id, instrument_id, type, status, price, total_quantity, filled_quantity
+		FROM order_book
+		WHERE
+			instrument_id = $1
+			AND type = 'buy'
+			AND status IN ('open', 'partially_filled')
+			AND price >= $2
+		ORDER BY
+			price DESC,
+			created_at ASC
+		FOR UPDATE SKIP LOCKED
+	`
+	rows, err := tx.Query(ctx, query, order.InstrumentId, order.Price)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var compatibleOrder OrderBook
+		if err := rows.Scan(&compatibleOrder.Id, &compatibleOrder.AccountId, &compatibleOrder.InstrumentId, &compatibleOrder.Type, &compatibleOrder.Status, &compatibleOrder.Price, &compatibleOrder.TotalQuantity, &compatibleOrder.FilledQuantity); err != nil {
+			return nil, err
+		}
+		compatibleOrders = append(compatibleOrders, compatibleOrder)
+	}
+
+	return compatibleOrders, nil
+}
+
+func processMatch(ctx context.Context, tx pgx.Tx, order OrderBook, match OrderBook, instrument InstrumentWithAssetsSchema) (OrderBook, error) {
+	// Split orders into buy and sell
+	var buyOrder, sellOrder OrderBook
+	if order.Type == Buy {
+		buyOrder = order
+		sellOrder = match
+	} else if order.Type == Sell && match.Type == Buy {
+		buyOrder = match
+		sellOrder = order
+	}
+
+	buyOrderAvailableQuantity := buyOrder.TotalQuantity.Sub(buyOrder.FilledQuantity)
+	sellOrderAvailableQuantity := sellOrder.TotalQuantity.Sub(sellOrder.FilledQuantity)
+
+	// Determine the quantity to fulfill
+	fullfillQuantity := decimal.Min(buyOrderAvailableQuantity, sellOrderAvailableQuantity)
+
+	// Fill each order
+	buyOrderNewFilledQuantity := buyOrder.FilledQuantity.Add(fullfillQuantity)
+	if err := fillOrder(ctx, tx, buyOrder, buyOrderNewFilledQuantity); err != nil {
+		return OrderBook{}, err
+	}
+	sellOrderNewFilledQuantity := sellOrder.FilledQuantity.Add(fullfillQuantity)
+	if err := fillOrder(ctx, tx, sellOrder, sellOrderNewFilledQuantity); err != nil {
+		return OrderBook{}, err
+	}
+
+	// Update orders statuses
+	if buyOrderNewFilledQuantity.GreaterThan(decimal.NewFromInt(0)) {
+		if buyOrderNewFilledQuantity.LessThan(buyOrder.TotalQuantity) {
+			if err := updateOrderStatus(ctx, tx, buyOrder.Id, PartiallyFilled); err != nil {
+				return OrderBook{}, err
+			}
+		} else {
+			if err := updateOrderStatus(ctx, tx, buyOrder.Id, FullFilled); err != nil {
+				return OrderBook{}, err
+			}
+		}
+	}
+	if sellOrderNewFilledQuantity.GreaterThan(decimal.NewFromInt(0)) {
+		if sellOrderNewFilledQuantity.LessThan(sellOrder.TotalQuantity) {
+			if err := updateOrderStatus(ctx, tx, sellOrder.Id, PartiallyFilled); err != nil {
+				return OrderBook{}, err
+			}
+		} else {
+			if err := updateOrderStatus(ctx, tx, sellOrder.Id, FullFilled); err != nil {
+				return OrderBook{}, err
+			}
+		}
+	}
+
+	// Charge the buy account with the asset
+	accountBalance, _, err := account.GetAccountBalance(ctx, tx, order.AccountId, nil, &instrument.BaseAssetId)
+	if err != nil {
+		return OrderBook{}, err
+	}
+	if accountBalance == nil {
+		err = account.CreateAccountBalanceForAccount(ctx, tx, order.AccountId, instrument.BaseAssetId)
+		if err != nil {
+			return OrderBook{}, err
+		}
+		accountBalance = &decimal.Decimal{}
+	}
+	newAccountBalance := accountBalance.Add(fullfillQuantity)
+	if err := account.UpdateAccountBalance(ctx, tx, order.AccountId, newAccountBalance, instrument.BaseAssetId); err != nil {
+		return OrderBook{}, err
+	}
+
+	// Charge the sell account with the quote asset
+	sellAccountBalance, _, err := account.GetAccountBalance(ctx, tx, sellOrder.AccountId, nil, &instrument.QuoteAssetId)
+	if err != nil {
+		return OrderBook{}, err
+	}
+	if sellAccountBalance == nil {
+		err = account.CreateAccountBalanceForAccount(ctx, tx, sellOrder.AccountId, instrument.QuoteAssetId)
+		if err != nil {
+			return OrderBook{}, err
+		}
+		sellAccountBalance = &decimal.Decimal{}
+	}
+	newSellAccountBalance := sellAccountBalance.Add(fullfillQuantity.Mul(sellOrder.Price))
+	if err := account.UpdateAccountBalance(ctx, tx, sellOrder.AccountId, newSellAccountBalance, instrument.QuoteAssetId); err != nil {
+		return OrderBook{}, err
+	}
+
+	// Update current order to return
+	if order.Type == Buy {
+		order.FilledQuantity = buyOrderNewFilledQuantity
+	} else {
+		order.FilledQuantity = sellOrderNewFilledQuantity
+	}
+
+	return order, nil
+}
+
+func fillOrder(ctx context.Context, tx pgx.Tx, order OrderBook, quantity decimal.Decimal) error {
+	_, err := tx.Exec(ctx, "UPDATE order_book SET filled_quantity = filled_quantity + $1 WHERE id = $2", quantity, order.Id)
 	return err
 }

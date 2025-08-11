@@ -32,7 +32,6 @@ CREATE TABLE IF NOT EXISTS account_balances (
     account_id UUID NOT NULL REFERENCES accounts(id),
     asset_id UUID NOT NULL REFERENCES assets(id),
     balance NUMERIC NOT NULL,
-    blocked_balance NUMERIC NOT NULL
 );
 -- ------------------------------------------------------------------
 
