@@ -46,9 +46,9 @@ func GetAccountsHandler(db *pgxpool.Pool) fiber.Handler {
 		pagination := helper.GetPagination[AccountShowSchema](c)
 
 		// Get total
-		count_query := "SELECT COUNT(*) FROM accounts"
+		countQuery := "SELECT COUNT(*) FROM accounts"
 		var total int
-		if err := db.QueryRow(context.Background(), count_query).Scan(&total); err != nil {
+		if err := db.QueryRow(context.Background(), countQuery).Scan(&total); err != nil {
 			return err
 		}
 		pagination.Total = &total

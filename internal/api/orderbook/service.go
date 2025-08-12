@@ -3,6 +3,7 @@ package orderbook
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/JhonesBR/go-clob/internal/api/account"
 	"github.com/JhonesBR/go-clob/internal/helper"
@@ -12,6 +13,53 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 )
+
+func GetOrderBookHandler(db *pgxpool.Pool) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		// Get pagination
+		pagination := helper.GetPagination[OrderBookShowSchema](c)
+
+		// Retrieve query
+		query := "SELECT {{query}} FROM order_book WHERE 1=1"
+		if c.Query("account_id") != "" {
+			query += " AND account_id = '" + c.Query("account_id") + "'"
+		}
+		if c.Query("instrument_id") != "" {
+			query += " AND instrument_id = '" + c.Query("instrument_id") + "'"
+		}
+
+		// Get total
+		countQuery := strings.Replace(query, "{{query}}", "COUNT(*)", 1)
+		var total int
+		if err := db.QueryRow(context.Background(), countQuery).Scan(&total); err != nil {
+			return err
+		}
+		pagination.Total = &total
+
+		// Retrieve order book
+		retrieveQuery := strings.Replace(query, "{{query}}", "id, account_id, instrument_id, type, status, price, total_quantity, filled_quantity", 1)
+		retrieveQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", pagination.Size, (pagination.Page-1)*pagination.Size)
+		rows, err := db.Query(context.Background(), retrieveQuery)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		var order_book = make(map[string]OrderBookShowSchema)
+		for rows.Next() {
+			var order OrderBookShowSchema
+			if err := rows.Scan(&order.Id, &order.AccountId, &order.InstrumentId, &order.Type, &order.Status, &order.Price, &order.TotalQuantity, &order.FilledQuantity); err != nil {
+				return err
+			}
+			order_book[order.Id.String()] = order
+		}
+
+		if len(order_book) > 0 {
+			pagination.Items = helper.MapToSlice(order_book)
+		}
+		return c.JSON(pagination)
+	}
+}
 
 func PlaceOrderHandler(ctx context.Context, db *pgxpool.Pool) fiber.Handler {
 	return func(c fiber.Ctx) error {
