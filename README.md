@@ -59,6 +59,8 @@ This project implements a simplified **Central Limit Order Book (CLOB)** and a m
 
 # API Endpoints
 
+## Accounts
+
 1. Create New Account
     - Endpoint: `POST /v1/accounts`
     - Description: Creates a new account.
@@ -133,7 +135,44 @@ This project implements a simplified **Central Limit Order Book (CLOB)** and a m
     }
     ```
 
-4. **Place Order**
+4. Add Balance to Account
+    - Endpoint: `POST /v1/accounts/{account-id}/charge`
+    - Description: Adds a balance to the account.
+    - Request Body:
+    ```json
+    {
+        "asset_code": "BTC",
+        "amount": "10"
+    }
+    ```
+    - Response:
+    ```json
+    {
+        "balance": "new-balance",
+        "asset_code": "BTC"
+    }
+
+5. Remove Balance from Account
+    - Endpoint: `POST /v1/accounts/{account-id}/remove`
+    - Description: Removes a balance from the account.
+    - Request Body:
+    ```json
+    {
+        "asset_code": "BTC",
+        "amount": "10"
+    }
+    ```
+    - Response:
+    ```json
+    {
+        "balance": "new-balance",
+        "asset_code": "BTC"
+    }
+    ```
+
+## Order Book
+
+1. **Place Order**
     - Endpoint: `POST /v1/order_book`
     - Description: Places a buy or sell order for the BTC/BRL instrument.
     - Request Body:
@@ -149,13 +188,13 @@ This project implements a simplified **Central Limit Order Book (CLOB)** and a m
     - Response:
     `204 No Content`
 
-5. **Cancel Order**
+2. **Cancel Order**
     - Endpoint: `POST /v1/order_book/:id/cancel`
     - Description: Cancels an open or partially filled order.
     - Response:
     `204 No Content`
 
-6. Get Order Book
+3. Get Order Book
     - Endpoint: `GET /v1/order_book`
         - Query parameters:
             - page
