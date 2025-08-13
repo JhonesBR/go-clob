@@ -32,7 +32,7 @@ func CreateNewAccountHandler(db *pgxpool.Pool) fiber.Handler {
 			return err
 		}
 
-		return c.JSON(CreateAccountResponseSchema{
+		return c.Status(fiber.StatusCreated).JSON(CreateAccountResponseSchema{
 			Id:       accountId.String(),
 			Name:     account.Name,
 			Balances: []AccountBalanceSchema{},
@@ -174,9 +174,15 @@ func UpdateAccountBalanceHandler(ctx context.Context, db *pgxpool.Pool, operatio
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				CreateAccountBalanceForAccount(ctx, tx, uuidId, *assetId)
+				balance = new(decimal.Decimal)
+				*balance = decimal.NewFromInt(0)
 			} else {
 				return err
 			}
+		} else if balance == nil {
+			CreateAccountBalanceForAccount(ctx, tx, uuidId, *assetId)
+			balance = new(decimal.Decimal)
+			*balance = decimal.NewFromInt(0)
 		}
 
 		switch operation {
