@@ -480,6 +480,6 @@ func processMatch(ctx context.Context, tx pgx.Tx, order OrderBook, match OrderBo
 }
 
 func fillOrder(ctx context.Context, tx pgx.Tx, order OrderBook, quantity decimal.Decimal) error {
-	_, err := tx.Exec(ctx, "UPDATE order_book SET filled_quantity = filled_quantity + $1 WHERE id = $2", quantity, order.Id)
+	_, err := tx.Exec(ctx, "UPDATE order_book SET filled_quantity = $1 WHERE id = $2", quantity, order.Id)
 	return err
 }
