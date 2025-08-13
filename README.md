@@ -55,6 +55,11 @@ This project implements a simplified **Central Limit Order Book (CLOB)** and a m
 5. Transactions:
     - All operations involving balances and orders are wrapped in database transactions to ensure consistency and deal with race conditions
 
+6. Tests:
+    - The script `tests/script.js` is used to test the API endpoints.
+    - The test structure is described in the [Tests](#Tests) section.
+    - The tests are run with [k6](https://k6.io/).
+
 ---
 
 # API Endpoints
@@ -286,3 +291,33 @@ Tables
     - Negative balances are allowed (no restrictions).
     - All operations are wrapped in transactions to ensure consistency and avoid race conditions.
     - Database is initialized with the `init.sql` script. The script creates the BTC/BRL instrument and assets.
+
+---
+
+# Tests
+
+## [Installation](https://grafana.com/docs/k6/latest/set-up/install-k6)
+
+```bash
+brew install k6
+```
+
+## Running
+
+```bash
+k6 run tests/script.js
+```
+
+## Test structure
+
+    1. Create two accounts
+    2. Charge accounts with BTC and BRL
+    3. Create multiple sell and buy orders
+    4. Check account balances
+    5. Create a big sell order
+    6. Buy then in small orders
+    7. Check account balances
+
+## Consideration
+- The script will populate the database with accounts and orders.
+
